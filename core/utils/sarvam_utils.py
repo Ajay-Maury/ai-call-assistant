@@ -6,7 +6,7 @@ from sarvamai import AsyncSarvamAI, SarvamAI
 from sarvamai.play import save
 
 from aiVoiceAssistant.constants import RESPONSE_AUDIO_CHUNK_DIR
-from aiVoiceAssistant.settings import SARVAM_LANGUAGE, SARVAM_PACE, SARVAM_STT_MODEL, SARVAM_SUBSCRIPTION_KEY, SARVAM_VOICE
+from aiVoiceAssistant.settings import SARVAM_LANGUAGE, SARVAM_PACE, SARVAM_STT_MODEL, SARVAM_SUBSCRIPTION_KEY, SARVAM_VOICE, SARVAM_TTS_MODEL
 
 
 client = SarvamAI(api_subscription_key=SARVAM_SUBSCRIPTION_KEY)
@@ -28,6 +28,9 @@ async def synthesize_mulaw_sarvam_tts(text: str, voice: str = SARVAM_VOICE, lang
             print("[Sarvam TTS]: No audio content received.")
             return b""
 
+        # ✅ Ensure directory exists
+        os.makedirs(RESPONSE_AUDIO_CHUNK_DIR, exist_ok=True)
+
         # Decode the first audio chunk (base64)
         wav_bytes = base64.b64decode(audio_response.audios[0])
 
@@ -48,7 +51,7 @@ async def synthesize_mulaw_sarvam_tts(text: str, voice: str = SARVAM_VOICE, lang
         with open(mulaw_path, "rb") as f:
             audio_data = f.read()
 
-        # Remove audio  files
+        # Clean up
         os.remove(wav_path)
         os.remove(mulaw_path)
 

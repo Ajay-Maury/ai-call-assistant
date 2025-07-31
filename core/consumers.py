@@ -1,10 +1,8 @@
-# your_app/consumers.py
-
 import asyncio
 import base64
 import hashlib
 import json
-import logging # 1. Import the logging module
+import logging
 import os
 from pathlib import Path
 from typing import Optional
@@ -12,7 +10,7 @@ from typing import Optional
 import webrtcvad
 from channels.generic.websocket import AsyncWebsocketConsumer
 from django.conf import settings
-from aiVoiceAssistant.constants import AUDIO_CHUNK_SIZE, DISENGAGEMENT_BACKCHANNEL_REPEAT_DELAY, DISENGAGEMENT_TRIGGER_SECONDS, ENGAGEMENT_BACKCHANNEL_REPEAT_DELAY, ENGAGEMENT_TRIGGER_SECONDS, INITIAL_GREETING_TEXT, AUDIO_SILENCE_THRESHOLDS, MIN_AUDIO_BYTES, SILENCE_MAX_DURATION, AUDIO_BUFFER_SILENCE, VAD_FRAME_SIZE, VAD_MIN_SILENCE_FRAMES
+from aiVoiceAssistant.constants import AUDIO_CACHE_DIR, AUDIO_CHUNK_SIZE, DISENGAGEMENT_BACKCHANNEL_REPEAT_DELAY, DISENGAGEMENT_TRIGGER_SECONDS, ENGAGEMENT_BACKCHANNEL_REPEAT_DELAY, ENGAGEMENT_TRIGGER_SECONDS, INITIAL_GREETING_TEXT, AUDIO_SILENCE_THRESHOLDS, MIN_AUDIO_BYTES, SILENCE_MAX_DURATION, AUDIO_BUFFER_SILENCE, VAD_FRAME_SIZE, VAD_MIN_SILENCE_FRAMES
 
 from core.utils.helper_utils import get_engagement_response
 from .utils.audio_utils import (convert_mulaw_to_wav, is_silent_mulaw_audio,
@@ -22,24 +20,14 @@ from .utils.open_ai_utils import (get_ai_response, is_user_engagement,
 from .utils.redis_utils import get_context, store_context
 from .utils.sarvam_utils import synthesize_mulaw_sarvam_tts
 
-# 2. Get a logger instance for this module
 logger = logging.getLogger(__name__)
-
-# WebRTC VAD instance
-vad = webrtcvad.Vad(2)  # Aggressiveness: 0–3
-
+vad = webrtcvad.Vad(2)
 
 class VoiceStreamConsumer(AsyncWebsocketConsumer):
-    """
-    This consumer handles the real-time voice stream from Twilio, fully ported
-    from the original Flask WebSocket implementation.
-    """
-
     async def connect(self):
         await self.accept()
         logger.info("✅ [Connect] WebSocket client connected.")
 
-        # Initialize state variables
         self.call_sid = None
         self.stream_sid = None
         self.raw_buffer = b""
@@ -55,6 +43,9 @@ class VoiceStreamConsumer(AsyncWebsocketConsumer):
         self.barge_in_detected = False
         self.silence_task = None
         self.engagement_task = None
+        self.engaged_once = False
+        self.disengaged_once = False
+        self.engagement_state = "unknown"  # new: manage state
         logger.info("✅ [Connect] Initial state variables set.")
 
     async def disconnect(self, close_code):
@@ -99,10 +90,16 @@ class VoiceStreamConsumer(AsyncWebsocketConsumer):
         )
         logger.info(f"🚀 [Handler-{self.call_sid}] Initial greeting task created.")
         store_context(self.call_sid, "Hello", INITIAL_GREETING_TEXT)
-
         logger.info(f"🚀 [Handler-{self.call_sid}] Launching background monitoring tasks...")
         self.silence_task = asyncio.create_task(self.detect_silence_and_respond())
         self.engagement_task = asyncio.create_task(self.monitor_user_engagement())
+        self.engagement_task.add_done_callback(self._log_engagement_task_done)
+
+    def _log_engagement_task_done(self, task):
+        try:
+            task.result()
+        except Exception as e:
+            logger.error(f"💥 Engagement task crashed: {e}", exc_info=True)
 
     async def _handle_media_event(self, data):
         audio_chunk = base64.b64decode(data["media"]["payload"])
@@ -137,62 +134,69 @@ class VoiceStreamConsumer(AsyncWebsocketConsumer):
 
     async def monitor_user_engagement(self):
         logger.info(f"🧐 [Engagement-{self.call_sid}] Starting user engagement monitor.")
-        last_engaged_time = 0
-        last_disengaged_time = 0
         silent_since = None
 
         while not self.stop_event.is_set():
-            await asyncio.sleep(0.50)
+            await asyncio.sleep(0.5)
             now = asyncio.get_event_loop().time()
-            user_is_talking = len(self.raw_buffer) > settings.MIN_AUDIO_BYTES
+            user_is_talking = len(self.raw_buffer) > MIN_AUDIO_BYTES
             tts_active = (self.engagement_tts_task and not self.engagement_tts_task.done()) or \
                          (self.response_tts_task and not self.response_tts_task.done())
-            
-            logger.info(f"🧐 [Engagement-{self.call_sid}] User is talking: {user_is_talking}, TTS is active: {tts_active}")
+            logger.debug(f"🔁 [Engagement-{self.call_sid}] Loop running. Buffer size: {len(self.raw_buffer)}")
 
             if user_is_talking:
+                if self.engagement_state != "talking":
+                    self.speech_start_time = now
+                self.engagement_state = "talking"
                 silent_since = None
-                if self.speech_start_time == 0: self.speech_start_time = now
                 time_speaking = now - self.speech_start_time
-                last_disengaged_time = 0
 
-                if not tts_active and not self.barge_in_detected and \
-                   ((last_engaged_time == 0 and time_speaking >= ENGAGEMENT_TRIGGER_SECONDS) or \
-                    (last_engaged_time > 0 and (now - last_engaged_time) >= ENGAGEMENT_BACKCHANNEL_REPEAT_DELAY)):
-                    
-                    logger.info(f"🧐 [Engagement-{self.call_sid}] User speaking for {time_speaking:.2f}s. Triggering ENGAGED response.")
+                if not self.barge_in_detected and not tts_active and \
+                   (not self.engaged_once and time_speaking >= ENGAGEMENT_TRIGGER_SECONDS):
+                    if self.engagement_tts_task and not self.engagement_tts_task.done():
+                        self.engagement_tts_task.cancel()
                     text = get_engagement_response("ENGAGED", "hi")
                     self.engagement_tts_stop_event.clear()
                     text_hash = hashlib.sha1(text.encode("utf-8")).hexdigest()
                     self.engagement_tts_task = asyncio.create_task(
                         self.stream_cached_or_generate_prompt(
-                            stop_event=self.engagement_tts_stop_event, greeting_text=text,
-                            cache_subdir=f"engaged_response/{text_hash}.ulaw", mark_name="engagement_response", mark_type="engagement",
+                            stop_event=self.engagement_tts_stop_event,
+                            greeting_text=text,
+                            cache_subdir=f"engaged_response/{text_hash}.ulaw",
+                            mark_name="engagement_response",
+                            mark_type="engagement",
                         )
                     )
-                    last_engaged_time = now
+                    self.raw_buffer = b""
+                    self.engaged_once = True
+                    self.disengaged_once = False
 
-            elif not tts_active:
-                if silent_since is None: silent_since = now
+            else:
+                if self.engagement_state != "silent":
+                    silent_since = now
+                self.engagement_state = "silent"
                 self.speech_start_time = 0
-                time_silent = now - silent_since
-                last_engaged_time = 0
+                time_silent = now - silent_since if silent_since else 0
 
-                if not self.barge_in_detected and \
-                   ((last_disengaged_time == 0 and time_silent >= DISENGAGEMENT_TRIGGER_SECONDS) or \
-                    (last_disengaged_time > 0 and (now - last_disengaged_time) >= DISENGAGEMENT_BACKCHANNEL_REPEAT_DELAY)):
-                    
-                    logger.info(f"🧐 [Engagement-{self.call_sid}] User silent for {time_silent:.2f}s. Triggering DISENGAGED response.")
+                if not self.barge_in_detected and not tts_active and \
+                   (not self.disengaged_once and time_silent >= DISENGAGEMENT_TRIGGER_SECONDS):
+                    if self.engagement_tts_task and not self.engagement_tts_task.done():
+                        self.engagement_tts_task.cancel()
                     text = get_engagement_response("DISENGAGED", "hi")
                     self.engagement_tts_stop_event.clear()
                     text_hash = hashlib.sha1(text.encode("utf-8")).hexdigest()
                     self.engagement_tts_task = asyncio.create_task(
                         self.stream_cached_or_generate_prompt(
-                            stop_event=self.engagement_tts_stop_event, greeting_text=text,
-                            cache_subdir=f"disengaged_response/{text_hash}.ulaw", mark_name="disengagement_response", mark_type="engagement",
+                            stop_event=self.engagement_tts_stop_event,
+                            greeting_text=text,
+                            cache_subdir=f"disengaged_response/{text_hash}.ulaw",
+                            mark_name="disengagement_response",
+                            mark_type="engagement",
                         )
                     )
-                    last_disengaged_time = now
+                    self.raw_buffer = b""
+                    self.disengaged_once = True
+                    self.engaged_once = False
 
     async def detect_silence_and_respond(self):
         logger.info(f"🤫 [Silence-{self.call_sid}] Starting silence and barge-in monitor.")
@@ -274,7 +278,7 @@ class VoiceStreamConsumer(AsyncWebsocketConsumer):
 
     async def stream_cached_or_generate_prompt(self, stop_event, greeting_text, cache_subdir, mark_name, mark_type):
         logger.info(f"🔊 [TTS-{self.call_sid}] Streaming prompt: '{greeting_text}'")
-        audio_cache_dir = Path(settings.AUDIO_CACHE_DIR)
+        audio_cache_dir = Path(AUDIO_CACHE_DIR)
         audio_cache_dir.mkdir(parents=True, exist_ok=True)
         audio_path = audio_cache_dir / cache_subdir
         audio_path.parent.mkdir(parents=True, exist_ok=True)
