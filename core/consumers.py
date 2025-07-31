@@ -1,0 +1,351 @@
+# your_app/consumers.py
+
+import asyncio
+import base64
+import hashlib
+import json
+import logging # 1. Import the logging module
+import os
+from pathlib import Path
+from typing import Optional
+
+import webrtcvad
+from channels.generic.websocket import AsyncWebsocketConsumer
+from django.conf import settings
+from aiVoiceAssistant.constants import AUDIO_CHUNK_SIZE, DISENGAGEMENT_BACKCHANNEL_REPEAT_DELAY, DISENGAGEMENT_TRIGGER_SECONDS, ENGAGEMENT_BACKCHANNEL_REPEAT_DELAY, ENGAGEMENT_TRIGGER_SECONDS, INITIAL_GREETING_TEXT, AUDIO_SILENCE_THRESHOLDS, MIN_AUDIO_BYTES, SILENCE_MAX_DURATION, AUDIO_BUFFER_SILENCE, VAD_FRAME_SIZE, VAD_MIN_SILENCE_FRAMES
+
+from core.utils.helper_utils import get_engagement_response
+from .utils.audio_utils import (convert_mulaw_to_wav, is_silent_mulaw_audio,
+                                is_voiced)
+from .utils.open_ai_utils import (get_ai_response, is_user_engagement,
+                                  transcribe_audio_whisper_groq)
+from .utils.redis_utils import get_context, store_context
+from .utils.sarvam_utils import synthesize_mulaw_sarvam_tts
+
+# 2. Get a logger instance for this module
+logger = logging.getLogger(__name__)
+
+# WebRTC VAD instance
+vad = webrtcvad.Vad(2)  # Aggressiveness: 0–3
+
+
+class VoiceStreamConsumer(AsyncWebsocketConsumer):
+    """
+    This consumer handles the real-time voice stream from Twilio, fully ported
+    from the original Flask WebSocket implementation.
+    """
+
+    async def connect(self):
+        await self.accept()
+        logger.info("✅ [Connect] WebSocket client connected.")
+
+        # Initialize state variables
+        self.call_sid = None
+        self.stream_sid = None
+        self.raw_buffer = b""
+        self.stop_event = asyncio.Event()
+        self.last_audio_time = asyncio.get_event_loop().time()
+        self.speech_start_time = 0
+        self.engagement_tts_task = None
+        self.engagement_tts_stop_event = asyncio.Event()
+        self.response_tts_task = None
+        self.response_tts_stop_event = asyncio.Event()
+        self.engagement_mark_name = None
+        self.response_mark_name = None
+        self.barge_in_detected = False
+        self.silence_task = None
+        self.engagement_task = None
+        logger.info("✅ [Connect] Initial state variables set.")
+
+    async def disconnect(self, close_code):
+        logger.info(f"🛑 [Disconnect-{self.call_sid}] Client disconnected with code: {close_code}. Performing cleanup...")
+        self.stop_event.set()
+        await self._cleanup_tasks()
+        logger.info(f"🛑 [Disconnect-{self.call_sid}] Cleanup complete.")
+
+    async def receive(self, text_data):
+        if not text_data:
+            return
+
+        data = json.loads(text_data)
+        event = data.get("event")
+        logger.info(f"➡️ [Receive-{self.call_sid}] Received event: '{event}'")
+
+        if event == "start":
+            start_data = data.get("start", {})
+            self.call_sid = start_data.get("callSid")
+            self.stream_sid = start_data.get("streamSid")
+            logger.info(f"➡️ [Start-{self.call_sid}] StreamSid: {self.stream_sid}")
+            await self._handle_start_event()
+
+        elif event == "media":
+            await self._handle_media_event(data)
+
+        elif event == "mark":
+            await self._handle_mark_event(data)
+
+    # 🔽 Event Handlers 🔽
+
+    async def _handle_start_event(self):
+        logger.info(f"🚀 [Handler-{self.call_sid}] Handling 'start' event.")
+        self.response_tts_task = asyncio.create_task(
+            self.stream_cached_or_generate_prompt(
+                stop_event=self.response_tts_stop_event,
+                greeting_text=INITIAL_GREETING_TEXT,
+                cache_subdir="initial_greet_response.ulaw",
+                mark_name="initial_greet_response",
+                mark_type="response",
+            )
+        )
+        logger.info(f"🚀 [Handler-{self.call_sid}] Initial greeting task created.")
+        store_context(self.call_sid, "Hello", INITIAL_GREETING_TEXT)
+
+        logger.info(f"🚀 [Handler-{self.call_sid}] Launching background monitoring tasks...")
+        self.silence_task = asyncio.create_task(self.detect_silence_and_respond())
+        self.engagement_task = asyncio.create_task(self.monitor_user_engagement())
+
+    async def _handle_media_event(self, data):
+        audio_chunk = base64.b64decode(data["media"]["payload"])
+        now = asyncio.get_event_loop().time()
+        if not is_silent_mulaw_audio(audio_chunk):
+            self.raw_buffer += audio_chunk
+            self.last_audio_time = now
+            if self.speech_start_time == 0:
+                self.speech_start_time = now
+        elif len(self.raw_buffer) > 0 and (now - self.last_audio_time) < SILENCE_MAX_DURATION:
+            self.raw_buffer += audio_chunk
+
+    async def _handle_mark_event(self, data):
+        mark_name = data.get("mark", {}).get("name")
+        logger.info(f"📌 [Mark-{self.call_sid}] Received mark: '{mark_name}'")
+        if not mark_name:
+            return
+        self.barge_in_detected = False
+        if mark_name.startswith("engagement_response") or mark_name.startswith("disengagement_response"):
+            self.engagement_tts_stop_event.set()
+            self.engagement_mark_name = mark_name
+        elif mark_name.startswith("ai_response"):
+            self.response_tts_stop_event.set()
+            self.response_mark_name = mark_name
+        else:
+            self.response_mark_name = self.engagement_mark_name = mark_name
+            self.engagement_tts_stop_event.set()
+            self.response_tts_stop_event.set()
+        logger.info(f"📌 [Mark-{self.call_sid}] State updated. Response Mark: {self.response_mark_name}, Engagement Mark: {self.engagement_mark_name}")
+
+    # 🔽 Ported Logic (now as class methods) 🔽
+
+    async def monitor_user_engagement(self):
+        logger.info(f"🧐 [Engagement-{self.call_sid}] Starting user engagement monitor.")
+        last_engaged_time = 0
+        last_disengaged_time = 0
+        silent_since = None
+
+        while not self.stop_event.is_set():
+            await asyncio.sleep(0.50)
+            now = asyncio.get_event_loop().time()
+            user_is_talking = len(self.raw_buffer) > settings.MIN_AUDIO_BYTES
+            tts_active = (self.engagement_tts_task and not self.engagement_tts_task.done()) or \
+                         (self.response_tts_task and not self.response_tts_task.done())
+            
+            logger.info(f"🧐 [Engagement-{self.call_sid}] User is talking: {user_is_talking}, TTS is active: {tts_active}")
+
+            if user_is_talking:
+                silent_since = None
+                if self.speech_start_time == 0: self.speech_start_time = now
+                time_speaking = now - self.speech_start_time
+                last_disengaged_time = 0
+
+                if not tts_active and not self.barge_in_detected and \
+                   ((last_engaged_time == 0 and time_speaking >= ENGAGEMENT_TRIGGER_SECONDS) or \
+                    (last_engaged_time > 0 and (now - last_engaged_time) >= ENGAGEMENT_BACKCHANNEL_REPEAT_DELAY)):
+                    
+                    logger.info(f"🧐 [Engagement-{self.call_sid}] User speaking for {time_speaking:.2f}s. Triggering ENGAGED response.")
+                    text = get_engagement_response("ENGAGED", "hi")
+                    self.engagement_tts_stop_event.clear()
+                    text_hash = hashlib.sha1(text.encode("utf-8")).hexdigest()
+                    self.engagement_tts_task = asyncio.create_task(
+                        self.stream_cached_or_generate_prompt(
+                            stop_event=self.engagement_tts_stop_event, greeting_text=text,
+                            cache_subdir=f"engaged_response/{text_hash}.ulaw", mark_name="engagement_response", mark_type="engagement",
+                        )
+                    )
+                    last_engaged_time = now
+
+            elif not tts_active:
+                if silent_since is None: silent_since = now
+                self.speech_start_time = 0
+                time_silent = now - silent_since
+                last_engaged_time = 0
+
+                if not self.barge_in_detected and \
+                   ((last_disengaged_time == 0 and time_silent >= DISENGAGEMENT_TRIGGER_SECONDS) or \
+                    (last_disengaged_time > 0 and (now - last_disengaged_time) >= DISENGAGEMENT_BACKCHANNEL_REPEAT_DELAY)):
+                    
+                    logger.info(f"🧐 [Engagement-{self.call_sid}] User silent for {time_silent:.2f}s. Triggering DISENGAGED response.")
+                    text = get_engagement_response("DISENGAGED", "hi")
+                    self.engagement_tts_stop_event.clear()
+                    text_hash = hashlib.sha1(text.encode("utf-8")).hexdigest()
+                    self.engagement_tts_task = asyncio.create_task(
+                        self.stream_cached_or_generate_prompt(
+                            stop_event=self.engagement_tts_stop_event, greeting_text=text,
+                            cache_subdir=f"disengaged_response/{text_hash}.ulaw", mark_name="disengagement_response", mark_type="engagement",
+                        )
+                    )
+                    last_disengaged_time = now
+
+    async def detect_silence_and_respond(self):
+        logger.info(f"🤫 [Silence-{self.call_sid}] Starting silence and barge-in monitor.")
+        while not self.stop_event.is_set():
+            await asyncio.sleep(0.25)
+            if len(self.raw_buffer) <= MIN_AUDIO_BYTES:
+                continue
+            
+            now = asyncio.get_event_loop().time()
+            elapsed_since_last_audio = now - self.last_audio_time
+            tts_active = self.response_tts_task and not self.response_tts_task.done()
+
+            logger.info(f"🤫 [Silence-{self.call_sid}] Raw buffer size: {len(self.raw_buffer)}, Elapsed since last audio: {elapsed_since_last_audio:.2f}s, TTS active: {tts_active}")
+            
+            # Barge-in Logic
+            if tts_active or (self.response_mark_name and not str(self.response_mark_name).endswith("tts_complete")):
+                logger.info(f"🤫 [Barge-In-{self.call_sid}] Detected! TTS is active, checking for interruption.")
+                self.barge_in_detected = True
+                audio_file_path = convert_mulaw_to_wav(self.call_sid, self.raw_buffer)
+                user_text = transcribe_audio_whisper_groq(audio_file_path, "hi")
+                is_engagement = await is_user_engagement(user_text, self.call_sid, "hi")
+                
+                if is_engagement:
+                    logger.info(f"🤫 [Barge-In-{self.call_sid}] Engagement detected ('{user_text}'), continuing TTS.")
+                    self.raw_buffer = b""
+                    self.speech_start_time = 0
+                    self.barge_in_detected = False
+                    continue
+                else:
+                    logger.info(f"🤫 [Barge-In-{self.call_sid}] User interrupted with '{user_text}'. Stopping TTS.")
+                    self.response_tts_stop_event.set()
+                    await self.send(text_data=json.dumps({"event": "clear", "streamSid": self.stream_sid}))
+                    self.raw_buffer = b""
+                    self.speech_start_time = 0
+                    self.barge_in_detected = False
+                    continue
+
+            # End of Speech Logic
+            frames = [self.raw_buffer[i:i + VAD_FRAME_SIZE] for i in range(0, len(self.raw_buffer), VAD_FRAME_SIZE)]
+            silent_frames = sum(1 for frame in frames[-5:] if len(frame) == VAD_FRAME_SIZE and not is_voiced(frame))
+
+            if silent_frames >= VAD_MIN_SILENCE_FRAMES or elapsed_since_last_audio > AUDIO_BUFFER_SILENCE:
+                logger.info(f"🤫 [Silence-{self.call_sid}] End of speech detected. Transcribing audio of size {len(self.raw_buffer)}...")
+                audio_to_process, self.raw_buffer = self.raw_buffer, b""
+                self.speech_start_time = 0
+
+                audio_file_path = convert_mulaw_to_wav(self.call_sid, audio_to_process)
+                user_text = transcribe_audio_whisper_groq(audio_file_path, "hi")
+                if audio_file_path: os.remove(audio_file_path)
+
+                if user_text:
+                    await self.handle_user_transcription(user_text)
+                else:
+                    logger.info(f"🤫 [Silence-{self.call_sid}] Transcription resulted in empty text.")
+
+    async def handle_user_transcription(self, user_text: str):
+        logger.info(f"🤖 [AI-{self.call_sid}] Handling transcription: '{user_text}'")
+        try:
+            self.response_mark_name = "ai_response"
+            context = get_context(self.call_sid)
+            ai_response = await get_ai_response(user_text, context, self.call_sid)
+            logger.info(f"🤖 [AI-{self.call_sid}] Generated AI response: '{ai_response}'")
+            store_context(self.call_sid, user_text, ai_response)
+
+            if self.response_tts_task and not self.response_tts_task.done():
+                logger.info(f"🤖 [AI-{self.call_sid}] Waiting for previous TTS task to complete.")
+                await self.wait_for_tts_finish(self.response_tts_task)
+
+            self.response_tts_stop_event.clear()
+            self.response_tts_task = asyncio.create_task(
+                self.stream_tts_to_client(
+                    text=ai_response,
+                    stop_event=self.response_tts_stop_event,
+                    mark_name="ai_response",
+                )
+            )
+        except Exception as e:
+            logger.error(f"🤖 [AI-{self.call_sid}] Error in transcription handling: {e}")
+
+    async def stream_cached_or_generate_prompt(self, stop_event, greeting_text, cache_subdir, mark_name, mark_type):
+        logger.info(f"🔊 [TTS-{self.call_sid}] Streaming prompt: '{greeting_text}'")
+        audio_cache_dir = Path(settings.AUDIO_CACHE_DIR)
+        audio_cache_dir.mkdir(parents=True, exist_ok=True)
+        audio_path = audio_cache_dir / cache_subdir
+        audio_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if not audio_path.exists():
+            logger.info(f"🔊 [TTS-{self.call_sid}] No cache found. Generating new audio.")
+            audio_buffer = await self.generate_mulaw_audio_buffer(greeting_text)
+            if not audio_buffer: return
+            with open(audio_path, "wb") as f:
+                f.write(audio_buffer)
+        else:
+            logger.info(f"🔊 [TTS-{self.call_sid}] Using cached audio from '{audio_path}'.")
+            with open(audio_path, "rb") as f:
+                audio_buffer = f.read()
+
+        if mark_type == "engagement": self.engagement_mark_name = mark_name
+        elif mark_type == "response": self.response_mark_name = mark_name
+
+        await self.play_audio_buffer_to_twilio(audio_buffer, stop_event, mark_name)
+
+    # 🔽 Core Helper Methods 🔽
+
+    async def wait_for_tts_finish(self, tts_task):
+        try:
+            await asyncio.shield(tts_task)
+        except asyncio.CancelledError: pass
+
+    async def generate_mulaw_audio_buffer(self, text: str) -> bytes:
+        try:
+            return await synthesize_mulaw_sarvam_tts(text)
+        except Exception as e:
+            logger.error(f"⚠️ [TTS Generation Error]: {e}")
+            return b""
+
+    async def play_audio_buffer_to_twilio(self, audio_buffer: bytes, stop_event: asyncio.Event, mark_name: Optional[str] = None):
+        if not audio_buffer: return
+        logger.info(f"▶️ [Player-{self.call_sid}] Playing audio buffer of size {len(audio_buffer)}.")
+        for i in range(0, len(audio_buffer), AUDIO_CHUNK_SIZE):
+            if stop_event.is_set():
+                logger.info(f"▶️ [Player-{self.call_sid}] Playback interrupted by stop event.")
+                break
+            try:
+                await self.send(text_data=json.dumps({
+                    "event": "media", "streamSid": self.stream_sid,
+                    "media": {"payload": base64.b64encode(audio_buffer[i:i+AUDIO_CHUNK_SIZE]).decode()}
+                }))
+            except Exception as e:
+                logger.error(f"⚠️ [Player-{self.call_sid}] WebSocket send error: {e}")
+                break
+            await asyncio.sleep(0.01)
+
+        if not stop_event.is_set() and mark_name:
+            logger.info(f"▶️ [Player-{self.call_sid}] Sending completion mark: '{mark_name}_tts_complete'")
+            await self.send(text_data=json.dumps({
+                "event": "mark", "streamSid": self.stream_sid,
+                "mark": {"name": f"{mark_name}_tts_complete"}
+            }))
+
+    async def stream_tts_to_client(self, text, stop_event, mark_name=None):
+        audio_buffer = await self.generate_mulaw_audio_buffer(text)
+        await self.play_audio_buffer_to_twilio(audio_buffer, stop_event, mark_name)
+
+    async def _cleanup_tasks(self):
+        """Helper to cancel and await background tasks."""
+        logger.info(f"🧹 [Cleanup-{self.call_sid}] Cancelling background tasks...")
+        tasks_to_cancel = [self.silence_task, self.engagement_task, self.response_tts_task, self.engagement_tts_task]
+        for task in tasks_to_cancel:
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        logger.info(f"🧹 [Cleanup-{self.call_sid}] All tasks cancelled.")
