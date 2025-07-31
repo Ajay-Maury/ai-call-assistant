@@ -10,9 +10,13 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/5.2/ref/settings/
 """
 
+import logging
 from pathlib import Path
 import os
 from dotenv import load_dotenv
+import pytz
+from datetime import datetime
+
 load_dotenv()
 
 
@@ -180,16 +184,27 @@ STATIC_URL = 'static/'
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 
+IST = pytz.timezone("Asia/Kolkata")
+
+class ISTFormatter(logging.Formatter):
+    def formatTime(self, record, datefmt=None):
+        dt = datetime.fromtimestamp(record.created, tz=IST)
+        if datefmt:
+            return dt.strftime(datefmt)
+        return dt.isoformat()
+
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
     "formatters": {
         "verbose": {
-            "format": "{levelname} {asctime} {module} {message}",
+            "()": ISTFormatter,
+            "format": "{levelname} {asctime} [{filename}:{funcName}:{lineno}] {message}",
             "style": "{",
         },
         "simple": {
-            "format": "{levelname} {message}",
+            "()": ISTFormatter,
+            "format": "{levelname} {asctime} [{filename}:{funcName}:{lineno}] {message}",
             "style": "{",
         },
     },
