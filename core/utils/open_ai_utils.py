@@ -94,7 +94,7 @@ async def is_user_engagement(
 
     if normalized in ENGAGEMENT_WORDS:
         return True
-    return False
+    # return False
 
     try:
         return await langchain_agent.classify_user_input_type(user_text, call_sid)

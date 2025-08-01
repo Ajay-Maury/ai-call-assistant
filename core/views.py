@@ -6,11 +6,11 @@ from rest_framework import status
 from twilio.twiml.voice_response import VoiceResponse, Connect
 from twilio.rest import Client
 
-from aiVoiceAssistant.settings import TWILIO_SID, TWILIO_TOKEN
+from aiVoiceAssistant.settings import TWILIO_NUMBER, TWILIO_SID, TWILIO_TOKEN
 
 # You can externalize these if needed
-WEB_SOCKET_URL = "wss://3nhvvprj-8765.inc1.devtunnels.ms/ws"
-VOICE_ROUTE_URL = "https://3nhvvprj-5001.inc1.devtunnels.ms/voice"
+WEB_SOCKET_URL = "wss://3nhvvprj-8000.inc1.devtunnels.ms/ws"
+VOICE_ROUTE_URL = "https://3nhvvprj-8000.inc1.devtunnels.ms/voice"
 
 client = Client(TWILIO_SID, TWILIO_TOKEN)
 

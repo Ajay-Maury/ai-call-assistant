@@ -46,6 +46,8 @@ class VoiceStreamConsumer(AsyncWebsocketConsumer):
         self.engaged_once = False
         self.disengaged_once = False
         self.engagement_state = "unknown"  # new: manage state
+        self.last_engaged_time = 0
+        self.last_disengaged_time = 0
         logger.info("✅ [Connect] Initial state variables set.")
 
     async def disconnect(self, close_code):
@@ -60,7 +62,7 @@ class VoiceStreamConsumer(AsyncWebsocketConsumer):
 
         data = json.loads(text_data)
         event = data.get("event")
-        logger.info(f"➡️ [Receive-{self.call_sid}] Received event: '{event}'")
+        # logger.info(f"➡️ [Receive-{self.call_sid}] Received event: '{event}'")
 
         if event == "start":
             start_data = data.get("start", {})
@@ -98,6 +100,8 @@ class VoiceStreamConsumer(AsyncWebsocketConsumer):
     def _log_engagement_task_done(self, task):
         try:
             task.result()
+        except asyncio.CancelledError:
+            logger.info("💤 Engagement task was cancelled.")
         except Exception as e:
             logger.error(f"💥 Engagement task crashed: {e}", exc_info=True)
 
@@ -136,25 +140,36 @@ class VoiceStreamConsumer(AsyncWebsocketConsumer):
         logger.info(f"🧐 [Engagement-{self.call_sid}] Starting user engagement monitor.")
         silent_since = None
 
+        logger.info(f"🧐 [Engagement-{self.call_sid}] Initializing engagement state: {self.engagement_state}, and stop event state:- {self.stop_event.is_set()}")
+
         while not self.stop_event.is_set():
             await asyncio.sleep(0.5)
             now = asyncio.get_event_loop().time()
             user_is_talking = len(self.raw_buffer) > MIN_AUDIO_BYTES
             tts_active = (self.engagement_tts_task and not self.engagement_tts_task.done()) or \
                          (self.response_tts_task and not self.response_tts_task.done())
-            logger.debug(f"🔁 [Engagement-{self.call_sid}] Loop running. Buffer size: {len(self.raw_buffer)}")
+            # logger.debug(f"🔁 [Engagement-{self.call_sid}] Loop running. Buffer size: {len(self.raw_buffer)}")
+            # logger.debug(f"🔁 [Engagement-{self.call_sid}] User talking: {user_is_talking}, TTS active: {tts_active}")
 
             if user_is_talking:
                 if self.engagement_state != "talking":
                     self.speech_start_time = now
                 self.engagement_state = "talking"
                 silent_since = None
+                if self.speech_start_time == 0:
+                    self.speech_start_time = now
                 time_speaking = now - self.speech_start_time
+                self.last_disengaged_time = 0
+
+                # logger.info(f"🗣️ [Engagement-{self.call_sid}] User is talking. Time speaking: {time_speaking:.2f}s, Buffer size: {len(self.raw_buffer)}")
 
                 if not self.barge_in_detected and not tts_active and \
-                   (not self.engaged_once and time_speaking >= ENGAGEMENT_TRIGGER_SECONDS):
+                   ((not self.engaged_once and time_speaking >= ENGAGEMENT_TRIGGER_SECONDS) or (self.last_engaged_time > 0 and now - self.last_engaged_time >= ENGAGEMENT_BACKCHANNEL_REPEAT_DELAY)):
+                    
                     if self.engagement_tts_task and not self.engagement_tts_task.done():
                         self.engagement_tts_task.cancel()
+                
+                    self.last_engaged_time = now
                     text = get_engagement_response("ENGAGED", "hi")
                     self.engagement_tts_stop_event.clear()
                     text_hash = hashlib.sha1(text.encode("utf-8")).hexdigest()
@@ -167,21 +182,33 @@ class VoiceStreamConsumer(AsyncWebsocketConsumer):
                             mark_type="engagement",
                         )
                     )
-                    self.raw_buffer = b""
                     self.engaged_once = True
-                    self.disengaged_once = False
+
+            elif (self.engagement_mark_name and not self.engagement_mark_name.endswith("tts_complete")) or (self.response_mark_name and not self.response_mark_name.endswith("tts_complete")):
+                # logger.info(f"🤫 [Silence-{self.call_sid}] Engagement mark is active, waiting for TTS to complete.")
+                # logger.info(f"🤫 [Silence-{self.call_sid}] engagement_mark_name: {self.engagement_mark_name}, response_mark_name: {self.response_mark_name}")
+                silent_since = None
+                self.last_disengaged_time = 0
+                self.engagement_state = "engaged"
 
             else:
+                # logger.info(f"🤫 [Silence-{self.call_sid}] User is silent. Engagement state: {self.engagement_state}"   )
                 if self.engagement_state != "silent":
                     silent_since = now
                 self.engagement_state = "silent"
                 self.speech_start_time = 0
                 time_silent = now - silent_since if silent_since else 0
+                self.last_engaged_time = 0
+
+                # logger.info(f"🤫 [Silence-{self.call_sid}] User is silent. Time silent: {time_silent:.2f}s, barge_in_detected:- {self.barge_in_detected}, tts_active:- {tts_active}")
+                # logger.info(f"disengaged_once:- {self.disengaged_once}, last_disengaged_time:- {self.last_disengaged_time}, now - last_disengaged_time:- {now - self.last_disengaged_time}")
 
                 if not self.barge_in_detected and not tts_active and \
-                   (not self.disengaged_once and time_silent >= DISENGAGEMENT_TRIGGER_SECONDS):
+                   ((not self.disengaged_once and time_silent >= DISENGAGEMENT_TRIGGER_SECONDS) or (self.last_disengaged_time > 0 and now - self.last_disengaged_time >= DISENGAGEMENT_BACKCHANNEL_REPEAT_DELAY)):
+                    
                     if self.engagement_tts_task and not self.engagement_tts_task.done():
                         self.engagement_tts_task.cancel()
+                    
                     text = get_engagement_response("DISENGAGED", "hi")
                     self.engagement_tts_stop_event.clear()
                     text_hash = hashlib.sha1(text.encode("utf-8")).hexdigest()
@@ -194,14 +221,15 @@ class VoiceStreamConsumer(AsyncWebsocketConsumer):
                             mark_type="engagement",
                         )
                     )
-                    self.raw_buffer = b""
+                    self.last_disengaged_time = now
                     self.disengaged_once = True
-                    self.engaged_once = False
+
 
     async def detect_silence_and_respond(self):
         logger.info(f"🤫 [Silence-{self.call_sid}] Starting silence and barge-in monitor.")
         while not self.stop_event.is_set():
             await asyncio.sleep(0.25)
+            logger.debug(f"🤫 [Silence-{self.call_sid}] Checking silence conditions. Raw buffer size: {len(self.raw_buffer)}")
             if len(self.raw_buffer) <= MIN_AUDIO_BYTES:
                 continue
             
@@ -209,7 +237,12 @@ class VoiceStreamConsumer(AsyncWebsocketConsumer):
             elapsed_since_last_audio = now - self.last_audio_time
             tts_active = self.response_tts_task and not self.response_tts_task.done()
 
-            logger.info(f"🤫 [Silence-{self.call_sid}] Raw buffer size: {len(self.raw_buffer)}, Elapsed since last audio: {elapsed_since_last_audio:.2f}s, TTS active: {tts_active}")
+            # End of Speech Logic
+            frames = [self.raw_buffer[i:i + VAD_FRAME_SIZE] for i in range(0, len(self.raw_buffer), VAD_FRAME_SIZE)]
+            silent_frames = sum(1 for frame in frames[-5:] if len(frame) == VAD_FRAME_SIZE and not is_voiced(frame))
+
+
+            logger.info(f"🤫 [Silence-{self.call_sid}] Raw buffer size: {len(self.raw_buffer)}, Elapsed since last audio: {elapsed_since_last_audio:.2f}s, silent_frames:- {silent_frames}, TTS active: {tts_active}")
             
             # Barge-in Logic
             if tts_active or (self.response_mark_name and not str(self.response_mark_name).endswith("tts_complete")):
@@ -234,17 +267,17 @@ class VoiceStreamConsumer(AsyncWebsocketConsumer):
                     self.barge_in_detected = False
                     continue
 
-            # End of Speech Logic
-            frames = [self.raw_buffer[i:i + VAD_FRAME_SIZE] for i in range(0, len(self.raw_buffer), VAD_FRAME_SIZE)]
-            silent_frames = sum(1 for frame in frames[-5:] if len(frame) == VAD_FRAME_SIZE and not is_voiced(frame))
-
             if silent_frames >= VAD_MIN_SILENCE_FRAMES or elapsed_since_last_audio > AUDIO_BUFFER_SILENCE:
                 logger.info(f"🤫 [Silence-{self.call_sid}] End of speech detected. Transcribing audio of size {len(self.raw_buffer)}...")
                 audio_to_process, self.raw_buffer = self.raw_buffer, b""
-                self.speech_start_time = 0
 
+                logger.info(f"🤫 [Silence-{self.call_sid}] Converting raw audio to WAV format for transcription.")
                 audio_file_path = convert_mulaw_to_wav(self.call_sid, audio_to_process)
+                logger.info(f"🤫 [Silence-{self.call_sid}] Converted audio to WAV at {audio_file_path}.")
+
                 user_text = transcribe_audio_whisper_groq(audio_file_path, "hi")
+
+                self.speech_start_time = 0
                 if audio_file_path: os.remove(audio_file_path)
 
                 if user_text:
@@ -271,6 +304,7 @@ class VoiceStreamConsumer(AsyncWebsocketConsumer):
                     text=ai_response,
                     stop_event=self.response_tts_stop_event,
                     mark_name="ai_response",
+                    mark_type="response"
                 )
             )
         except Exception as e:
@@ -297,7 +331,7 @@ class VoiceStreamConsumer(AsyncWebsocketConsumer):
         if mark_type == "engagement": self.engagement_mark_name = mark_name
         elif mark_type == "response": self.response_mark_name = mark_name
 
-        await self.play_audio_buffer_to_twilio(audio_buffer, stop_event, mark_name)
+        await self.play_audio_buffer_to_twilio(audio_buffer, stop_event, mark_name, mark_type)
 
     # 🔽 Core Helper Methods 🔽
 
@@ -313,7 +347,7 @@ class VoiceStreamConsumer(AsyncWebsocketConsumer):
             logger.error(f"⚠️ [TTS Generation Error]: {e}")
             return b""
 
-    async def play_audio_buffer_to_twilio(self, audio_buffer: bytes, stop_event: asyncio.Event, mark_name: Optional[str] = None):
+    async def play_audio_buffer_to_twilio(self, audio_buffer: bytes, stop_event: asyncio.Event, mark_name: Optional[str] = None, mark_type: Optional[str] = None):
         if not audio_buffer: return
         logger.info(f"▶️ [Player-{self.call_sid}] Playing audio buffer of size {len(audio_buffer)}.")
         for i in range(0, len(audio_buffer), AUDIO_CHUNK_SIZE):
@@ -336,10 +370,12 @@ class VoiceStreamConsumer(AsyncWebsocketConsumer):
                 "event": "mark", "streamSid": self.stream_sid,
                 "mark": {"name": f"{mark_name}_tts_complete"}
             }))
+            # if mark_type == "engagement": self.engagement_mark_name = f"{mark_name}_tts_complete"
+            # elif mark_type == "response": self.response_mark_name = f"{mark_name}_tts_complete"
 
-    async def stream_tts_to_client(self, text, stop_event, mark_name=None):
+    async def stream_tts_to_client(self, text, stop_event, mark_name=None, mark_type=None):
         audio_buffer = await self.generate_mulaw_audio_buffer(text)
-        await self.play_audio_buffer_to_twilio(audio_buffer, stop_event, mark_name)
+        await self.play_audio_buffer_to_twilio(audio_buffer, stop_event, mark_name, mark_type)
 
     async def _cleanup_tasks(self):
         """Helper to cancel and await background tasks."""

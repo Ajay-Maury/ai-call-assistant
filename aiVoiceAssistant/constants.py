@@ -1,3 +1,5 @@
+import os
+
 
 AI_SYSTEM_PROMPT = """You are Manisha, a friendly and conversational voice agent from Aman Tech Innovations.
 
@@ -84,10 +86,16 @@ ENGAGEMENT_RESPONSES = {
     }
 }
 # Audio settings
-AUDIO_CHUNK_DIR = "audio_chunks"
-RESPONSE_AUDIO_CHUNK_DIR = "response_audio_chunks"
+AUDIO_CHUNK_DIR = "audio_chunks_input"
+RESPONSE_AUDIO_CHUNK_DIR = "audio_chunks_response"
 AUDIO_CACHE_DIR = "static/audio_cache"
 
+# Ensure audio directories exist
+os.makedirs(AUDIO_CHUNK_DIR, exist_ok=True)
+os.makedirs(RESPONSE_AUDIO_CHUNK_DIR, exist_ok=True)
+os.makedirs(AUDIO_CACHE_DIR, exist_ok=True)
+
+# Audio processing constants
 AUDIO_CHUNK_SIZE = 160
 AUDIO_SAMPLE_RATE = 8000
 SILENCE_MAX_DURATION = 0.8

@@ -6,3 +6,5 @@ postgres_data/
 static/
 venv
 .venv
+
+audio_chunks_*

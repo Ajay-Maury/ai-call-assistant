@@ -33,7 +33,7 @@ SECRET_KEY = 'django-insecure-9(3_%vq^1fke8rh!o@32zn5-d%8!m&8zd3wsegu9tbv!((0^5-
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = ['*']
 
 
 # Load environment variables from .env file
