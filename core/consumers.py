@@ -5,6 +5,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import time
 from typing import Optional
 
 import webrtcvad
@@ -14,11 +15,11 @@ from aiVoiceAssistant.constants import AUDIO_CACHE_DIR, AUDIO_CHUNK_SIZE, DISENG
 
 from core.utils.helper_utils import get_engagement_response
 from .utils.audio_utils import (convert_mulaw_to_wav, is_silent_mulaw_audio,
-                                is_voiced)
+                                is_voiced, split_text_by_punctuation_and_word_count, split_text_by_speech_phrases, split_text_by_word_count)
 from .utils.open_ai_utils import (get_ai_response, is_user_engagement,
                                   transcribe_audio_whisper_groq)
 from .utils.redis_utils import get_context, store_context
-from .utils.sarvam_utils import synthesize_mulaw_sarvam_tts
+from .utils.sarvam_utils import  synthesize_mulaw_sarvam_tts
 
 logger = logging.getLogger(__name__)
 vad = webrtcvad.Vad(2)
@@ -268,6 +269,9 @@ class VoiceStreamConsumer(AsyncWebsocketConsumer):
                     continue
 
             if silent_frames >= VAD_MIN_SILENCE_FRAMES or elapsed_since_last_audio > AUDIO_BUFFER_SILENCE:
+
+                start_time = time.time()
+
                 logger.info(f"🤫 [Silence-{self.call_sid}] End of speech detected. Transcribing audio of size {len(self.raw_buffer)}...")
                 audio_to_process, self.raw_buffer = self.raw_buffer, b""
 
@@ -275,7 +279,11 @@ class VoiceStreamConsumer(AsyncWebsocketConsumer):
                 audio_file_path = convert_mulaw_to_wav(self.call_sid, audio_to_process)
                 logger.info(f"🤫 [Silence-{self.call_sid}] Converted audio to WAV at {audio_file_path}.")
 
+                logger.info(f"[Timing] Received mulaw to wav audio in {time.time() - start_time:.2f}s")
+                start_time = time.time()
+
                 user_text = transcribe_audio_whisper_groq(audio_file_path, "hi")
+                logger.info(f"[Timing] Transcribed audio to text: '{user_text}' in {time.time() - start_time:.2f}s")
 
                 self.speech_start_time = 0
                 if audio_file_path: os.remove(audio_file_path)
@@ -288,9 +296,14 @@ class VoiceStreamConsumer(AsyncWebsocketConsumer):
     async def handle_user_transcription(self, user_text: str):
         logger.info(f"🤖 [AI-{self.call_sid}] Handling transcription: '{user_text}'")
         try:
+
+            start_time = time.time()
+
             self.response_mark_name = "ai_response"
             context = get_context(self.call_sid)
             ai_response = await get_ai_response(user_text, context, self.call_sid)
+
+            logger.info(f"[Timing] Generated AI response in {time.time() - start_time:.2f}s")
             logger.info(f"🤖 [AI-{self.call_sid}] Generated AI response: '{ai_response}'")
             store_context(self.call_sid, user_text, ai_response)
 
@@ -373,10 +386,170 @@ class VoiceStreamConsumer(AsyncWebsocketConsumer):
             # if mark_type == "engagement": self.engagement_mark_name = f"{mark_name}_tts_complete"
             # elif mark_type == "response": self.response_mark_name = f"{mark_name}_tts_complete"
 
-    async def stream_tts_to_client(self, text, stop_event, mark_name=None, mark_type=None):
-        audio_buffer = await self.generate_mulaw_audio_buffer(text)
-        await self.play_audio_buffer_to_twilio(audio_buffer, stop_event, mark_name, mark_type)
+    # async def stream_tts_to_client(self, text, stop_event, mark_name=None, mark_type=None):
+    #     audio_buffer = await self.generate_mulaw_audio_buffer(text)
+    #     await self.play_audio_buffer_to_twilio(audio_buffer, stop_event, mark_name, mark_type)
 
+
+    # async def stream_tts_to_client(self, text, stop_event, mark_name=None, mark_type=None):
+    #     """
+    #     Streams TTS to Twilio in small chunks using punctuation-based splitting.
+    #     """
+    #     try:
+
+    #         chunks = split_text_by_speech_phrases(text)
+    #         logger.info(f"📣 [TTS-{self.call_sid}]: Splitting text into {len(chunks)} chunks.")
+
+    #         for idx, chunk in enumerate(chunks):
+    #             if stop_event.is_set():
+    #                 logger.info(f"🛑 [TTS-{self.call_sid}]: Stop event triggered. Exiting stream early.")
+    #                 break
+
+    #             logger.debug(f"🔊 [TTS-{self.call_sid}]: Synthesizing chunk {idx+1}/{len(chunks)}: '{chunk}'")
+    #             start_time = time.time()
+    #             audio_buffer = await self.generate_mulaw_audio_buffer(chunk)
+    #             logger.info(f"[Timing] Generated audio buffer in {time.time() - start_time:.2f}s")
+
+    #             await self.play_audio_buffer_to_twilio(audio_buffer, stop_event)
+
+    #         if not stop_event.is_set() and mark_name:
+    #             logger.info(f"✅ [TTS-{self.call_sid}]: All chunks sent. Sending mark: {mark_name}_tts_complete")
+    #             await self.send(text_data=json.dumps({
+    #                 "event": "mark",
+    #                 "streamSid": self.stream_sid,
+    #                 "mark": {"name": f"{mark_name}_tts_complete"}
+    #             }))
+
+    #     except Exception as e:
+    #         logger.error(f"❌ [TTS-{self.call_sid}]: Error in chunked TTS streaming: {e}")
+
+
+    # async def stream_tts_to_client(self, text, stop_event, mark_name=None, mark_type=None):
+    #     """
+    #     Streams TTS to Twilio in small chunks using punctuation-based splitting.
+    #     Chunks are synthesized in parallel to reduce latency.
+    #     """
+    #     try:
+    #         chunks = split_text_by_speech_phrases(text)
+    #         logger.info(f"📣 [TTS-{self.call_sid}]: Splitting text into {len(chunks)} chunks.")
+
+    #         if stop_event.is_set():
+    #             logger.info(f"🛑 [TTS-{self.call_sid}]: Stop event triggered before synthesis. Exiting early.")
+    #             return
+
+    #         start_time = time.time()
+    #         audio_buffers = await parallel_synthesize_chunks(chunks, concurrency=3)
+    #         logger.info(f"[Timing] Synthesized {len(audio_buffers)} chunks in {time.time() - start_time:.2f}s")
+
+    #         for idx, audio_buffer in enumerate(audio_buffers):
+    #             if stop_event.is_set():
+    #                 logger.info(f"🛑 [TTS-{self.call_sid}]: Stop event triggered. Exiting playback loop.")
+    #                 break
+
+    #             logger.debug(f"▶️ [TTS-{self.call_sid}]: Playing chunk {idx+1}/{len(audio_buffers)} (size={len(audio_buffer)})")
+    #             await self.play_audio_buffer_to_twilio(audio_buffer, stop_event)
+
+    #         if not stop_event.is_set() and mark_name:
+    #             logger.info(f"✅ [TTS-{self.call_sid}]: All chunks sent. Sending mark: {mark_name}_tts_complete")
+    #             await self.send(text_data=json.dumps({
+    #                 "event": "mark",
+    #                 "streamSid": self.stream_sid,
+    #                 "mark": {"name": f"{mark_name}_tts_complete"}
+    #             }))
+
+    #     except Exception as e:
+    #         logger.exception(f"❌ [TTS-{self.call_sid}]: Error in parallel TTS streaming: {e}")
+
+
+    # async def stream_tts_to_client(self, text, stop_event, mark_name=None, mark_type=None):
+    #     try:
+    #         chunks = split_text_by_word_count(text, max_words=15)
+    #         queue = asyncio.Queue()
+    #         logger.info(f"📣 [TTS-{self.call_sid}]: Split text into {len(chunks)} chunks")
+
+    #         async def producer():
+    #             for idx, chunk in enumerate(chunks):
+    #                 if stop_event.is_set():
+    #                     logger.info(f"🛑 [TTS-{self.call_sid}]: Stop triggered during synthesis.")
+    #                     break
+    #                 start_t = time.perf_counter()
+    #                 logger.debug(f"🔊 [TTS-{self.call_sid}]: Synthesizing chunk {idx+1}/{len(chunks)}: '{chunk}'")
+    #                 audio = await synthesize_mulaw_sarvam_tts(chunk)
+    #                 elapsed = time.perf_counter() - start_t
+    #                 logger.info(f"[Timing] Synthesized chunk {idx+1} in {elapsed:.2f}s")
+    #                 await queue.put(audio)
+    #             await queue.put(None)  # Sentinel to signal completion
+
+    #         async def consumer():
+    #             chunk_index = 1
+    #             while True:
+    #                 audio = await queue.get()
+    #                 if audio is None:
+    #                     break
+    #                 logger.debug(f"▶️ [TTS-{self.call_sid}]: Playing chunk {chunk_index}")
+    #                 await self.play_audio_buffer_to_twilio(audio, stop_event)
+    #                 chunk_index += 1
+
+    #         await asyncio.gather(producer(), consumer())
+
+    #         if not stop_event.is_set() and mark_name:
+    #             await self.send(text_data=json.dumps({
+    #                 "event": "mark",
+    #                 "streamSid": self.stream_sid,
+    #                 "mark": {"name": f"{mark_name}_tts_complete"}
+    #             }))
+    #             logger.info(f"✅ [TTS-{self.call_sid}]: Finished all chunks, sent mark: {mark_name}_tts_complete")
+
+    #     except Exception as e:
+    #         logger.exception(f"❌ [TTS-{self.call_sid}]: Error during stream: {e}")
+
+
+    async def stream_tts_to_client(self, text, stop_event, mark_name=None, mark_type=None):
+        try:
+            chunks = split_text_by_word_count(text, max_words=15)
+            queue = asyncio.Queue()
+            logger.info(f"📣 [TTS-{self.call_sid}]: Split text into {len(chunks)} chunks")
+
+            async def producer():
+                for idx, chunk in enumerate(chunks):
+                    if stop_event.is_set():
+                        logger.info(f"🛑 [TTS-{self.call_sid}]: Stop triggered during synthesis.")
+                        break
+                    start_t = time.perf_counter()
+                    logger.debug(f"🔊 [TTS-{self.call_sid}]: Synthesizing chunk {idx+1}/{len(chunks)}: '{chunk}'")
+                    audio = await synthesize_mulaw_sarvam_tts(chunk)
+                    elapsed = time.perf_counter() - start_t
+                    logger.info(f"[Timing] Synthesized chunk {idx+1} in {elapsed:.2f}s")
+                    await queue.put(audio)
+                await queue.put(None)  # Sentinel
+
+            async def consumer():
+                chunk_index = 1
+                while True:
+                    audio = await queue.get()
+                    if audio is None:
+                        break
+                    logger.debug(f"▶️ [TTS-{self.call_sid}]: Playing chunk {chunk_index}")
+                    await self.play_audio_buffer_to_twilio(audio, stop_event)
+                    chunk_index += 1
+
+            # ✅ LAUNCH PRODUCER FIRST (not blocking)
+            producer_task = asyncio.create_task(producer())
+            await consumer()
+            await producer_task  # Ensure cleanup
+
+            if not stop_event.is_set() and mark_name:
+                await self.send(text_data=json.dumps({
+                    "event": "mark",
+                    "streamSid": self.stream_sid,
+                    "mark": {"name": f"{mark_name}_tts_complete"}
+                }))
+                logger.info(f"✅ [TTS-{self.call_sid}]: Finished all chunks, sent mark: {mark_name}_tts_complete")
+
+        except Exception as e:
+            logger.exception(f"❌ [TTS-{self.call_sid}]: Error during stream: {e}")
+
+            
     async def _cleanup_tasks(self):
         """Helper to cancel and await background tasks."""
         logger.info(f"🧹 [Cleanup-{self.call_sid}] Cancelling background tasks...")

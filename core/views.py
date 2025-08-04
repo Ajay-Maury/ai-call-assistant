@@ -10,7 +10,7 @@ from aiVoiceAssistant.settings import TWILIO_NUMBER, TWILIO_SID, TWILIO_TOKEN
 
 # You can externalize these if needed
 WEB_SOCKET_URL = "wss://3nhvvprj-8000.inc1.devtunnels.ms/ws"
-VOICE_ROUTE_URL = "https://3nhvvprj-8000.inc1.devtunnels.ms/voice"
+VOICE_ROUTE_URL = "https://3nhvvprj-8000.inc1.devtunnels.ms/voice/"
 
 client = Client(TWILIO_SID, TWILIO_TOKEN)
 

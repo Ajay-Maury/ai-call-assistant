@@ -1,5 +1,6 @@
 import asyncio
 import os
+import re
 import uuid
 import subprocess
 import numpy as np
@@ -200,3 +201,116 @@ def is_voiced(audio_bytes: bytes, sample_rate: int = 8000, frame_duration_ms: in
     except Exception as e:
         logger.exception(f"[VAD Error]: {e}")
         return False
+
+
+def split_text_by_speech_phrases(text: str, max_len: int = 200) -> list[str]:
+    """
+    Split text into smaller speech-friendly chunks using punctuation.
+    """
+    if not text:
+        return []
+
+    chunks = re.split(r'(?<=[.?!,])\s+', text.strip())
+    output = []
+    buffer = ""
+    for chunk in chunks:
+        if len(buffer) + len(chunk) <= max_len:
+            buffer += " " + chunk
+        else:
+            output.append(buffer.strip())
+            buffer = chunk
+    if buffer:
+        output.append(buffer.strip())
+    return output
+
+def split_text_by_length(text: str, max_words: int = 10) -> list[str]:
+    # First split by punctuation (., !, ?), then split further by word count
+    raw_chunks = re.split(r'(?<=[.!?])\s+', text)
+    final_chunks = []
+
+    for chunk in raw_chunks:
+        words = chunk.split()
+        while len(words) > max_words:
+            final_chunks.append("     ".join(words[:max_words]))
+            words = words[max_words:]
+        if words:
+            final_chunks.append("     ".join(words))
+
+    return [c.strip() for c in final_chunks if c.strip()]
+
+
+def split_text_by_punctuation_and_word_count(text, max_words=15):
+    """
+    Splits text into smaller chunks using punctuation and word count.
+    Ensures punctuation is preserved and placed at the end of each segment.
+    """
+    # Step 1: Split text using all meaningful punctuation
+    raw_segments = re.split(r'([.!?,;:—–…])', text)
+
+    # Step 2: Reconstruct segments with punctuation
+    segments = []
+    i = 0
+    while i < len(raw_segments):
+        part = raw_segments[i].strip()
+        if not part:
+            i += 1
+            continue
+
+        if i + 1 < len(raw_segments) and re.match(r'[.!?,;:—–…]', raw_segments[i + 1]):
+            segment = f"{part}{raw_segments[i + 1]}"
+            i += 2
+        else:
+            segment = part
+            i += 1
+        segments.append(segment.strip())
+
+    # Step 3: Split segments into word-limited chunks
+    final_chunks = []
+    for seg in segments:
+        words = seg.split()
+        for i in range(0, len(words), max_words):
+            chunk = ' '.join(words[i:i + max_words])
+            if not re.search(r'[.!?,;:—–…]$', chunk.strip()):
+                chunk += '.'  # add period if none at end
+            final_chunks.append(chunk.strip())
+
+    return final_chunks
+
+
+import re
+
+def split_text_by_word_count(text: str, max_words: int = 15) -> list[str]:
+    """
+    Splits text first by punctuation, then by word count within each segment.
+
+    Args:
+        text (str): Input text to split.
+        max_words (int): Max words per chunk.
+
+    Returns:
+        List[str]: List of chunks suitable for TTS.
+    """
+    chunks = []
+
+    # Step 1: Split by punctuation while capturing it
+    segments = re.split(r'([.!?,;:—–…])', text)
+    grouped = []
+
+    # Step 2: Merge punctuation back with its preceding text
+    for i in range(0, len(segments), 2):
+        part = segments[i].strip()
+        punctuation = segments[i+1].strip() if i+1 < len(segments) else ""
+        if part:
+            grouped.append(part + punctuation)
+
+    # Step 3: Split each group by word count
+    for group in grouped:
+        words = group.strip().split()
+        for i in range(0, len(words), max_words):
+            chunk = ' '.join(words[i:i + max_words])
+            if not re.search(r'[.!?,;:—–…]$', chunk.strip()):
+                chunk += '.'  # Add period if none present at the end
+            chunks.append(chunk)
+
+    return chunks
+
