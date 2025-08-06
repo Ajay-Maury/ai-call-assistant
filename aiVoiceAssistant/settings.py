@@ -65,6 +65,7 @@ SARVAM_LANGUAGE = os.getenv("SARVAM_LANGUAGE", "hi-IN")
 SARVAM_TTS_MODEL = os.getenv("SARVAM_TTS_MODEL", "bulbul:v2")
 SARVAM_STT_MODEL = os.getenv("SARVAM_STT_MODEL", "saarika:v2.5")
 SARVAM_PACE = float(os.getenv("SARVAM_PACE", 1.0))
+SARVAM_PITCH = float(os.getenv("SARVAM_PITCH", 0.2))
 
 # Misc
 REDIS_URL = os.getenv("REDIS_URL")

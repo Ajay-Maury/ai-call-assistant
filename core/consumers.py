@@ -5,6 +5,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import time
 from typing import Optional
 
 import webrtcvad
@@ -13,12 +14,13 @@ from django.conf import settings
 from aiVoiceAssistant.constants import AUDIO_CACHE_DIR, AUDIO_CHUNK_SIZE, DISENGAGEMENT_BACKCHANNEL_REPEAT_DELAY, DISENGAGEMENT_TRIGGER_SECONDS, ENGAGEMENT_BACKCHANNEL_REPEAT_DELAY, ENGAGEMENT_TRIGGER_SECONDS, INITIAL_GREETING_TEXT, AUDIO_SILENCE_THRESHOLDS, MIN_AUDIO_BYTES, SILENCE_MAX_DURATION, AUDIO_BUFFER_SILENCE, VAD_FRAME_SIZE, VAD_MIN_SILENCE_FRAMES
 
 from core.utils.helper_utils import get_engagement_response
+from core.utils.langchain_agent import LangChainAIAgent
 from .utils.audio_utils import (convert_mulaw_to_wav, is_silent_mulaw_audio,
                                 is_voiced)
 from .utils.open_ai_utils import (get_ai_response, is_user_engagement,
                                   transcribe_audio_whisper_groq)
 from .utils.redis_utils import get_context, store_context
-from .utils.sarvam_utils import synthesize_mulaw_sarvam_tts
+from .utils.sarvam_utils import synthesize_mulaw_sarvam_tts, synthesize_streaming_sarvam_tts
 
 logger = logging.getLogger(__name__)
 vad = webrtcvad.Vad(2)
@@ -270,12 +272,20 @@ class VoiceStreamConsumer(AsyncWebsocketConsumer):
             if silent_frames >= VAD_MIN_SILENCE_FRAMES or elapsed_since_last_audio > AUDIO_BUFFER_SILENCE:
                 logger.info(f"🤫 [Silence-{self.call_sid}] End of speech detected. Transcribing audio of size {len(self.raw_buffer)}...")
                 audio_to_process, self.raw_buffer = self.raw_buffer, b""
+                
+                start_time = time.time()
 
                 logger.info(f"🤫 [Silence-{self.call_sid}] Converting raw audio to WAV format for transcription.")
                 audio_file_path = convert_mulaw_to_wav(self.call_sid, audio_to_process)
+                
+                logger.info(f"[Timing] Received mulaw to wav audio in {time.time() - start_time:.2f}s")
+                start_time = time.time()
+                
                 logger.info(f"🤫 [Silence-{self.call_sid}] Converted audio to WAV at {audio_file_path}.")
 
                 user_text = transcribe_audio_whisper_groq(audio_file_path, "hi")
+
+                logger.info(f"[Timing] Transcribed audio to text: '{user_text}' in {time.time() - start_time:.2f}s")
 
                 self.speech_start_time = 0
                 if audio_file_path: os.remove(audio_file_path)
@@ -288,9 +298,20 @@ class VoiceStreamConsumer(AsyncWebsocketConsumer):
     async def handle_user_transcription(self, user_text: str):
         logger.info(f"🤖 [AI-{self.call_sid}] Handling transcription: '{user_text}'")
         try:
+            start_time = time.time()
+
             self.response_mark_name = "ai_response"
             context = get_context(self.call_sid)
-            ai_response = await get_ai_response(user_text, context, self.call_sid)
+            # ai_response = await get_ai_response(user_text, context, self.call_sid)
+            # Use streaming AI response with streaming TTS
+
+            logger.info(f"[Timing] Fetched context for response in {time.time() - start_time:.2f}s")
+            start_time = time.time()
+
+            ai_response = await self.handle_streaming_ai_response( user_text, context)
+
+            logger.info(f"[Timing] Completed streaming AI response in {time.time() - start_time:.2f}s")
+
             logger.info(f"🤖 [AI-{self.call_sid}] Generated AI response: '{ai_response}'")
             store_context(self.call_sid, user_text, ai_response)
 
@@ -376,6 +397,158 @@ class VoiceStreamConsumer(AsyncWebsocketConsumer):
     async def stream_tts_to_client(self, text, stop_event, mark_name=None, mark_type=None):
         audio_buffer = await self.generate_mulaw_audio_buffer(text)
         await self.play_audio_buffer_to_twilio(audio_buffer, stop_event, mark_name, mark_type)
+
+
+    async def stream_real_time_tts_to_client(self, text, stop_event, mark_name=None):
+        """Stream TTS audio using Sarvam AI's streaming API for real-time playback."""
+        logger.info(f"[Streaming-TTS-{self.call_sid}]: Starting real-time TTS for: {text}")
+        audio_generated = False
+        start_time = time.time()
+
+        try:
+            tts_stream_start = time.time()
+            async for audio_chunk in synthesize_streaming_sarvam_tts(text):
+                if stop_event.is_set():
+                    logger.info(f"[Streaming-TTS-{self.call_sid}]: Playback interrupted by stop event")
+                    break
+
+                if not audio_chunk:
+                    continue
+
+                audio_generated = True
+
+                for i in range(0, len(audio_chunk), AUDIO_CHUNK_SIZE):
+                    if stop_event.is_set():
+                        logger.info(f"[Streaming-TTS-{self.call_sid}]: Playback interrupted during chunk")
+                        break
+
+                    chunk = audio_chunk[i: i + AUDIO_CHUNK_SIZE]
+                    try:
+                        await self.send(text_data=json.dumps({
+                            "event": "media",
+                            "streamSid": self.stream_sid,
+                            "media": {"payload": base64.b64encode(chunk).decode()},
+                        }))
+                    except Exception as e:
+                        logger.error(f"[Streaming-TTS-{self.call_sid}]: Error sending chunk: {e}")
+                        return
+
+                    await asyncio.sleep(0.01)
+
+            logger.info(f"[Timing-TTS-{self.call_sid}] Streaming TTS completed in {time.time() - tts_stream_start:.2f}s")
+
+        except Exception as e:
+            logger.error(f"[Streaming-TTS-{self.call_sid}]: Error during streaming: {e}")
+
+        if not audio_generated:
+            logger.warning(f"[Streaming-TTS-{self.call_sid}]: No audio generated, using fallback")
+            try:
+                fallback_start = time.time()
+                audio_chunk = await synthesize_mulaw_sarvam_tts(text)
+                logger.info(f"[Timing-TTS-{self.call_sid}] Fallback TTS took {time.time() - fallback_start:.2f}s")
+
+                if audio_chunk:
+                    for i in range(0, len(audio_chunk), AUDIO_CHUNK_SIZE):
+                        if stop_event.is_set():
+                            logger.info(f"[Fallback-TTS-{self.call_sid}]: Playback interrupted")
+                            break
+                        chunk = audio_chunk[i: i + AUDIO_CHUNK_SIZE]
+                        try:
+                            await self.send(text_data=json.dumps({
+                                "event": "media",
+                                "streamSid": self.stream_sid,
+                                "media": {"payload": base64.b64encode(chunk).decode()},
+                            }))
+                        except Exception as e:
+                            logger.error(f"[Fallback-TTS-{self.call_sid}]: Error sending fallback chunk: {e}")
+                            return
+                        await asyncio.sleep(0.01)
+                    audio_generated = True
+            except Exception as fallback_e:
+                logger.error(f"[Fallback-TTS-{self.call_sid}]: Fallback TTS failed: {fallback_e}")
+
+        if not stop_event.is_set() and audio_generated:
+            await self.send(text_data=json.dumps({
+                "event": "mark",
+                "streamSid": self.stream_sid,
+                "mark": {"name": f"{mark_name}_tts_complete" if mark_name else "streaming_tts_complete"},
+            }))
+            logger.info(f"[Streaming-TTS-{self.call_sid}]: Streaming complete, sent mark")
+
+        logger.info(f"[Timing-TTS-{self.call_sid}] Total TTS handling time: {time.time() - start_time:.2f}s")
+
+
+    async def handle_streaming_ai_response(self, user_text, context):
+        """Handle AI response with streaming agent and streaming TTS."""
+        logger.info(f"[Streaming-AI-{self.call_sid}]: Processing streaming AI response for: {user_text}")
+        total_start = time.time()
+
+        try:
+            agent = LangChainAIAgent()
+            response_chunks = []
+            sentence_buffer = ""
+
+            ai_start = time.time()
+            async for chunk in agent.process_query_streaming(user_text, self.call_sid, context):
+                response_chunks.append(chunk)
+                sentence_buffer += chunk
+
+                if sentence_buffer.strip().endswith(('.', '!', '?')) or len(sentence_buffer.strip()) > 50:
+                    if sentence_buffer.strip():
+                        logger.info(f"[Streaming-AI-{self.call_sid}]: Sending chunk to TTS: {sentence_buffer.strip()}")
+
+                        tts_wait_start = time.time()
+                        if self.response_tts_task and not self.response_tts_task.done():
+                            await self.wait_for_tts_finish(self.response_tts_task)
+                        logger.info(f"[Timing-AI-{self.call_sid}] Waited {time.time() - tts_wait_start:.2f}s for previous TTS")
+
+                        self.response_tts_stop_event.clear()
+                        tts_stream_start = time.time()
+                        self.response_tts_task = asyncio.create_task(
+                            self.stream_real_time_tts_to_client(
+                                sentence_buffer.strip(),
+                                self.response_tts_stop_event,
+                                mark_name="streaming_ai_chunk"
+                            )
+                        )
+                        sentence_buffer = ""
+                        await asyncio.sleep(0.1)
+
+            logger.info(f"[Timing-AI-{self.call_sid}] AI streaming response received in {time.time() - ai_start:.2f}s")
+
+            # Handle any remaining buffer
+            if sentence_buffer.strip():
+                logger.info(f"[Streaming-AI-{self.call_sid}]: Sending final chunk to TTS: {sentence_buffer.strip()}")
+                if self.response_tts_task and not self.response_tts_task.done():
+                    await self.wait_for_tts_finish(self.response_tts_task)
+
+                self.response_tts_stop_event.clear()
+                self.response_tts_task = asyncio.create_task(
+                    self.stream_real_time_tts_to_client(
+                        sentence_buffer.strip(),
+                        self.response_tts_stop_event,
+                        mark_name="streaming_ai_final"
+                    )
+                )
+
+            final_response = "".join(response_chunks)
+
+            context_store_start = time.time()
+            store_context(self.call_sid, user_text, final_response)
+            logger.info(f"[Timing-AI-{self.call_sid}] Stored context in {time.time() - context_store_start:.2f}s")
+
+            logger.info(f"[Timing-AI-{self.call_sid}] Total streaming AI response time: {time.time() - total_start:.2f}s")
+            return final_response
+
+        except Exception as e:
+            logger.error(f"[Streaming-AI-{self.call_sid}]: Error in streaming AI response: {e}")
+            fallback_ai_start = time.time()
+            ai_response = await get_ai_response(user_text, context, self.call_sid)
+            logger.info(f"[Timing-AI-{self.call_sid}] Fallback AI response took {time.time() - fallback_ai_start:.2f}s")
+
+            store_context(self.call_sid, user_text, ai_response)
+            return ai_response
+
 
     async def _cleanup_tasks(self):
         """Helper to cancel and await background tasks."""
