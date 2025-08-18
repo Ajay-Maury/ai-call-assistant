@@ -38,7 +38,7 @@ Do you have a quick minute for me to share how it might help your business?"
 """
 
 
-INITIAL_GREETING_TEXT = "Hi there, this is Manisha from Omen Tech Innovations! Kya aap kisi business ko chalate hain ya kisi aise business ke saath kaam karte hain jo customer calls handle karta hai?"
+INITIAL_GREETING_TEXT = "Hi there, this is Manisha from Aman Tech Innovations! Kya aap kisi business ko chalate hain ya kisi aise business ke saath kaam karte hain jo customer calls handle karta hai?"
 
 # Predefined user engagement expressions
 ENGAGEMENT_WORDS = {
