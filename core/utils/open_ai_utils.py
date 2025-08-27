@@ -2,17 +2,18 @@ import asyncio
 import os
 import re
 import time
+import logging
 from typing import Optional, Set
 import uuid
 from groq import Groq
 import whisper
 from openai import AsyncOpenAI, OpenAI
 
-
 from aiVoiceAssistant.constants import ENGAGEMENT_WORDS
 from aiVoiceAssistant.settings import GROQ_API_KEY, GROQ_CHAT_TEMPERATURE, GROQ_STT_MODEL, OPENAI_API_KEY, OPENAI_MODEL, WHISPER_STT_OFFLINE_MODEL
 from core.utils.langchain_agent import LangChainAIAgent
 
+logger = logging.getLogger(__name__)
 
 openai_client = OpenAI(
     api_key=OPENAI_API_KEY,
@@ -28,24 +29,24 @@ langchain_agent = LangChainAIAgent()
 
 async def get_ai_response(user_input, context=None, call_sid="default"):
     try:
-        print("User input:", user_input)
-        
+        logger.info(f"User input: {user_input}")
+
         # Convert the Redis context format to the expected format
         redis_context = context if context else []
-        
+
         # Use the langchain agent to process the query with Redis context
         response = await langchain_agent.process_query(user_input, call_sid, redis_context)
-        
+
         return response.strip() if response else ""
     except Exception as e:
-        print("LangChain agent error:", e)
+        logger.error(f"LangChain agent error: {e}", exc_info=True)
         return "Sorry, something went wrong."
 
 
 def transcribe_audio_whisper_groq(filepath, lang="hi"):
     try:
         start_time = time.time()
-        print(f"Transcribing {filepath} with groq in {lang} language...")
+        logger.info(f"Transcribing {filepath} with groq in {lang} language...")
 
         with open(filepath, "rb") as audio_file:
             transcription = groq_client.audio.translations.create(
@@ -55,15 +56,16 @@ def transcribe_audio_whisper_groq(filepath, lang="hi"):
                     "Transcribe audio from users who often speak in a mix of Hindi/indian-languages and English. "
                     "Preserve meaning, skip background noise, ignore filler sounds like 'umm', 'aaa', 'okay' etc, and if there is no valid response then do not return any random text instead of that return an empty response like ''"
                 ),
-                temperature=GROQ_CHAT_TEMPERATURE
+                temperature=GROQ_CHAT_TEMPERATURE,
             )
         endtime = time.time()
 
-        print(f"Groq Whisper v3-turbo response time : {endtime - start_time:.2f}")
-        print(f"Groq Whisper v3-turbo response: {transcription.text}")
-        return transcription.text.strip() if hasattr(transcription, 'text') else ""
+        logger.info(f"Groq Whisper v3-turbo response time: {endtime - start_time:.2f}s")
+        logger.info(f"Groq Whisper v3-turbo response: {getattr(transcription, 'text', None)}")
+
+        return transcription.text.strip() if hasattr(transcription, "text") else ""
     except Exception as e:
-        print("Groq Whisper v3-turbo error:", e)
+        logger.error(f"Groq Whisper v3-turbo error: {e}", exc_info=True)
         raise e
 
 
@@ -88,7 +90,7 @@ async def is_user_engagement(
 
     # Collapse multiple spaces to a single space
     normalized = re.sub(r"\s+", " ", text)
-    
+
     if not normalized:
         return True
 
@@ -99,6 +101,6 @@ async def is_user_engagement(
     try:
         return await langchain_agent.classify_user_input_type(user_text, call_sid)
     except Exception as e:
-        print(f"[BargeIn-{call_sid}]: LLM classification error: {e}")
+        logger.error(f"[BargeIn-{call_sid}]: LLM classification error: {e}", exc_info=True)
         return False
 

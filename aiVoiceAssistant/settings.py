@@ -186,6 +186,15 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 
 IST = pytz.timezone("Asia/Kolkata")
+# ANSI escape color codes
+COLORS = {
+    "DEBUG": "\033[90m",   # Gray
+    "INFO": "\033[94m",    # Blue
+    "WARNING": "\033[93m", # Yellow
+    "ERROR": "\033[91m",   # Red
+    "CRITICAL": "\033[95m" # Magenta
+}
+RESET = "\033[0m"
 
 class ISTFormatter(logging.Formatter):
     def formatTime(self, record, datefmt=None):
@@ -194,18 +203,37 @@ class ISTFormatter(logging.Formatter):
             return dt.strftime(datefmt)
         return dt.isoformat()
 
+    def format(self, record):
+        # Apply color only to `[LEVELNAME | TIME]`
+        if record.levelname in COLORS:
+            record.asctime = self.formatTime(record)
+            colored_header = f"{COLORS[record.levelname]}{record.levelname} | {record.asctime}{RESET}"
+            record.colored_header = colored_header
+        else:
+            record.colored_header = f"{record.levelname} | {self.formatTime(record)}"
+        return super().format(record)
+
+
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
     "formatters": {
-        "verbose": {
-            "()": ISTFormatter,
-            "format": "{levelname} {asctime} [{filename}:{funcName}:{lineno}] {message}",
-            "style": "{",
-        },
         "simple": {
             "()": ISTFormatter,
-            "format": "{levelname} {asctime} [{filename}:{funcName}:{lineno}] {message}",
+            "format": (
+                "\n"
+                "[{colored_header}] | in→ {filename}:{funcName}: line→ {lineno}\n"
+                "→ {message}\n"
+            ),
+            "style": "{",
+        },
+        "verbose": {
+            "()": ISTFormatter,
+            "format": (
+                "\n"
+                "[{colored_header}] | in→ {filename}:{funcName}: line→ {lineno}\n"
+                "→ {message}\n"
+            ),
             "style": "{",
         },
     },

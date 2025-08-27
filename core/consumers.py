@@ -320,14 +320,14 @@ class VoiceStreamConsumer(AsyncWebsocketConsumer):
                 await self.wait_for_tts_finish(self.response_tts_task)
 
             self.response_tts_stop_event.clear()
-            self.response_tts_task = asyncio.create_task(
-                self.stream_tts_to_client(
-                    text=ai_response,
-                    stop_event=self.response_tts_stop_event,
-                    mark_name="ai_response",
-                    mark_type="response"
-                )
-            )
+            # self.response_tts_task = asyncio.create_task(
+            #     self.stream_tts_to_client(
+            #         text=ai_response,
+            #         stop_event=self.response_tts_stop_event,
+            #         mark_name="ai_response",
+            #         mark_type="response"
+            #     )
+            # )
         except Exception as e:
             logger.error(f"🤖 [AI-{self.call_sid}] Error in transcription handling: {e}")
 
@@ -412,6 +412,7 @@ class VoiceStreamConsumer(AsyncWebsocketConsumer):
                     logger.info(f"[Streaming-TTS-{self.call_sid}]: Playback interrupted by stop event")
                     break
 
+                logger.info(f"[Streaming-TTS-{self.call_sid}]: Received audio chunk of size {len(audio_chunk)}")
                 if not audio_chunk:
                     continue
 
